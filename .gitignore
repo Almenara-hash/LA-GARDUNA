@@ -1,0 +1,6 @@
+/*.log
+/vendor/
+/node_modules/
+/config.php
+/includes/conexion.php
+*.env
