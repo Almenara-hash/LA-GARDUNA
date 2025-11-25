@@ -2,58 +2,137 @@
 session_start();
 include('includes/conexion.php');
 
-// PROTEGER PANEL: SOLO ADMIN
-if (!isset($_SESSION['rol']) || $_SESSION['rol'] != 'admin') {
+// ================================
+//   PROTEGER PANEL: SOLO ADMIN
+// ================================
+if (!isset($_SESSION['usuario_rol']) || $_SESSION['usuario_rol'] !== 'admin') {
     header("Location: login.php");
     exit;
 }
 
-// --------------------------
-// ACCIONES DEL ADMIN
-// --------------------------
+$mensaje = "";
 
-// Confirmar cita (cambiar estado a confirmada)
-if (isset($_GET['confirmar'])) {
-    $id = intval($_GET['confirmar']);
-    $conn->query("UPDATE citas SET estado='confirmada' WHERE id_cita=$id");
+// ================================
+//   FUNCIÓN PARA PRECIO SEGÚN SERVICIO
+// ================================
+function obtenerPrecio($servicio)
+{
+    $s = strtolower($servicio);
+
+    if (strpos($s, 'corte') !== false) return "12 €";
+    if (strpos($s, 'barba') !== false) return "4 €";
+    if (strpos($s, 'lavado') !== false) return "4 €";
+
+    return "-";
 }
 
-// Cancelar/Eliminar cita y liberar disponibilidad
+// ================================
+//   CONFIRMAR CITA
+// ================================
+if (isset($_GET['confirmar'])) {
+    $id = intval($_GET['confirmar']);
+
+    $stmt = $conn->prepare("UPDATE citas SET estado='confirmada' WHERE id_cita=?");
+    $stmt->bind_param("i", $id);
+    $stmt->execute();
+
+    $mensaje = "Cita confirmada correctamente.";
+}
+
+// ================================
+//   CANCELAR CITA + LIBERAR DISPONIBILIDAD
+// ================================
 if (isset($_GET['cancelar'])) {
     $id = intval($_GET['cancelar']);
 
-    // Recuperar id_disponibilidad
-    $sql = $conn->query("SELECT id_disponibilidad FROM citas WHERE id_cita=$id");
-    if ($sql && $sql->num_rows > 0) {
-        $fila = $sql->fetch_assoc();
+    $stmt = $conn->prepare("SELECT id_disponibilidad FROM citas WHERE id_cita=?");
+    $stmt->bind_param("i", $id);
+    $stmt->execute();
+    $res = $stmt->get_result();
+
+    if ($res->num_rows > 0) {
+
+        $fila = $res->fetch_assoc();
         $id_disp = $fila['id_disponibilidad'];
 
-        // Borrar la cita
-        $conn->query("DELETE FROM citas WHERE id_cita=$id");
+        $del = $conn->prepare("DELETE FROM citas WHERE id_cita=?");
+        $del->bind_param("i", $id);
+        $del->execute();
 
-        // Marcar disponibilidad como libre
-        $conn->query("UPDATE disponibilidad SET disponible=1 WHERE id_disponibilidad=$id_disp");
+        $upd = $conn->prepare("UPDATE disponibilidad SET disponible=1 WHERE id_disponibilidad=?");
+        $upd->bind_param("i", $id_disp);
+        $upd->execute();
+
+        $mensaje = "Cita cancelada y disponibilidad liberada.";
     }
 }
 
-// Añadir nueva disponibilidad
-if (isset($_POST['nueva_fecha']) && isset($_POST['nueva_hora'])) {
+// ================================
+//   AÑADIR DISPONIBILIDAD
+// ================================
+if ($_SERVER["REQUEST_METHOD"] === "POST" && isset($_POST['nueva_fecha'], $_POST['nueva_hora'])) {
+
     $fecha = $_POST['nueva_fecha'];
-    $hora  = $_POST['nueva_hora'];
-    $conn->query("INSERT INTO disponibilidad (fecha, hora, disponible) VALUES ('$fecha', '$hora', 1)");
+    $hora = $_POST['nueva_hora'];
+
+    // Horario permitido
+    $mananaInicio = "10:00";
+    $mananaFin    = "14:00";
+    $tardeInicio  = "17:00";
+    $tardeFin     = "20:30";
+
+    if (
+        !(
+            ($hora >= $mananaInicio && $hora <= $mananaFin) ||
+            ($hora >= $tardeInicio  && $hora <= $tardeFin)
+        )
+    ) {
+        $mensaje = "Hora fuera del horario permitido.";
+    } else {
+
+        // EVITAR DUPLICADOS
+        $check = $conn->prepare("SELECT id_disponibilidad FROM disponibilidad WHERE fecha=? AND hora=?");
+        $check->bind_param("ss", $fecha, $hora);
+        $check->execute();
+        $res = $check->get_result();
+
+        if ($res->num_rows > 0) {
+            $mensaje = "Ya existe disponibilidad en ese horario.";
+        } else {
+            $stmt = $conn->prepare("INSERT INTO disponibilidad (fecha, hora, disponible) VALUES (?, ?, 1)");
+            $stmt->bind_param("ss", $fecha, $hora);
+            $stmt->execute();
+            $mensaje = "Nueva disponibilidad añadida.";
+        }
+    }
 }
 
-// Eliminar disponibilidad
+// ================================
+//   ELIMINAR DISPONIBILIDAD
+// ================================
 if (isset($_GET['eliminar_disp'])) {
     $id = intval($_GET['eliminar_disp']);
-    $conn->query("DELETE FROM disponibilidad WHERE id_disponibilidad=$id");
+
+    // SOLO SI NO TIENE CITAS
+    $check = $conn->prepare("SELECT * FROM citas WHERE id_disponibilidad=?");
+    $check->bind_param("i", $id);
+    $check->execute();
+    $res = $check->get_result();
+
+    if ($res->num_rows === 0) {
+        $del = $conn->prepare("DELETE FROM disponibilidad WHERE id_disponibilidad=?");
+        $del->bind_param("i", $id);
+        $del->execute();
+
+        $mensaje = "Disponibilidad eliminada.";
+    } else {
+        $mensaje = "No se puede eliminar: tiene citas asociadas.";
+    }
 }
 
-// --------------------------
-// CONSULTAS PRINCIPALES
-// --------------------------
-
-// Citas con JOIN a usuarios y disponibilidad
+// ================================
+//   CONSULTAS
+// ================================
 $citas = $conn->query("
     SELECT 
         c.id_cita,
@@ -69,149 +148,192 @@ $citas = $conn->query("
     ORDER BY d.fecha, d.hora
 ");
 
-// Usuarios
 $usuarios = $conn->query("SELECT * FROM usuarios ORDER BY id_usuario");
-
-// Disponibilidad
 $disponibilidad = $conn->query("SELECT * FROM disponibilidad ORDER BY fecha, hora");
+
 ?>
 <!DOCTYPE html>
 <html lang="es">
 <head>
-    <meta charset="UTF-8">
-    <title>Panel de Administración - La Garduña</title>
+<meta charset="UTF-8">
+<title>Panel de Administración | La Garduña</title>
+
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<link rel="stylesheet" href="public/css/style.css">
 </head>
-<body>
 
-<h1>Panel de Administración – La Garduña</h1>
+<body class="bg-light">
 
-<p>
-    Bienvenido, administrador: 
-    <strong>
-        <?php 
-        // En tu login usas $_SESSION["usuario"]
-        echo isset($_SESSION['usuario']) ? $_SESSION['usuario'] : 'Admin'; 
-        ?>
-    </strong>
-</p>
+<div class="container py-4">
 
-<p><a href="logout.php">Cerrar sesión</a></p>
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h1 class="fw-bold">Panel de Administración</h1>
+        <a href="logout.php" class="btn btn-danger btn-sm">Cerrar sesión</a>
+    </div>
 
-<hr>
-
-<!-- =====================
-     GESTIÓN DE CITAS
-====================== -->
-<h2>Citas registradas</h2>
-
-<table border="1" cellpadding="5" cellspacing="0">
-    <tr>
-        <th>ID</th>
-        <th>Cliente</th>
-        <th>Email</th>
-        <th>Fecha</th>
-        <th>Hora</th>
-        <th>Servicio</th>
-        <th>Estado</th>
-        <th>Acciones</th>
-    </tr>
-
-    <?php if ($citas && $citas->num_rows > 0): ?>
-        <?php while ($c = $citas->fetch_assoc()): ?>
-            <tr>
-                <td><?php echo $c['id_cita']; ?></td>
-                <td><?php echo $c['cliente']; ?></td>
-                <td><?php echo $c['email']; ?></td>
-                <td><?php echo $c['fecha']; ?></td>
-                <td><?php echo $c['hora']; ?></td>
-                <td><?php echo $c['servicio']; ?></td>
-                <td><?php echo $c['estado']; ?></td>
-                <td>
-                    <a href="admin.php?confirmar=<?php echo $c['id_cita']; ?>">Confirmar</a> |
-                    <a href="admin.php?cancelar=<?php echo $c['id_cita']; ?>">Eliminar</a>
-                </td>
-            </tr>
-        <?php endwhile; ?>
-    <?php else: ?>
-        <tr><td colspan="8">No hay citas registradas.</td></tr>
+    <?php if (!empty($mensaje)): ?>
+        <div class="alert alert-info alert-auto shadow-sm text-center">
+            <?= htmlspecialchars($mensaje) ?>
+        </div>
     <?php endif; ?>
-</table>
 
-<hr>
+    <div class="alert alert-secondary shadow-sm">
+        Bienvenido, <strong><?= htmlspecialchars($_SESSION['usuario_nombre']) ?></strong>
+    </div>
 
-<!-- =====================
-     GESTIÓN DE USUARIOS
-====================== -->
-<h2>Usuarios registrados</h2>
+    <hr>
 
-<table border="1" cellpadding="5" cellspacing="0">
-    <tr>
-        <th>ID</th>
-        <th>Nombre</th>
-        <th>Email</th>
-        <th>Rol</th>
-    </tr>
+    <!-- =====================
+         GESTIÓN DE CITAS
+    ====================== -->
+    <h2 class="mb-3">Citas registradas</h2>
 
-    <?php if ($usuarios && $usuarios->num_rows > 0): ?>
+    <div class="table-responsive mb-4">
+        <table class="table table-bordered table-striped">
+            <thead class="table-dark">
+                <tr>
+                    <th>ID</th>
+                    <th>Cliente</th>
+                    <th>Email</th>
+                    <th>Fecha</th>
+                    <th>Hora</th>
+                    <th>Servicio</th>
+                    <th>Precio</th>
+                    <th>Estado</th>
+                    <th>Acciones</th>
+                </tr>
+            </thead>
+
+            <tbody>
+                <?php if ($citas->num_rows > 0): ?>
+                    <?php while ($c = $citas->fetch_assoc()): ?>
+                        <tr>
+                            <td><?= $c['id_cita'] ?></td>
+                            <td><?= htmlspecialchars($c['cliente']) ?></td>
+                            <td><?= htmlspecialchars($c['email']) ?></td>
+                            <td><?= $c['fecha'] ?></td>
+                            <td><?= substr($c['hora'], 0, 5) ?></td>
+                            <td><?= htmlspecialchars($c['servicio']) ?></td>
+                            <td><strong><?= obtenerPrecio($c['servicio']) ?></strong></td>
+
+                            <td>
+                                <span class="badge bg-<?= $c['estado'] === 'confirmada' ? 'success' : 'warning' ?>">
+                                    <?= $c['estado'] ?>
+                                </span>
+                            </td>
+
+                            <td>
+                                <a href="admin.php?confirmar=<?= $c['id_cita'] ?>" 
+                                   class="btn btn-success btn-sm">
+                                   ✔
+                                </a>
+
+                                <a href="admin.php?cancelar=<?= $c['id_cita'] ?>" 
+                                   class="btn btn-danger btn-sm"
+                                   data-confirm="¿Cancelar esta cita?">
+                                   ✖
+                                </a>
+                            </td>
+                        </tr>
+                    <?php endwhile; ?>
+
+                <?php else: ?>
+                    <tr><td colspan="9" class="text-center">No hay citas registradas.</td></tr>
+                <?php endif; ?>
+            </tbody>
+        </table>
+    </div>
+
+    <hr>
+
+    <!-- =====================
+         USUARIOS
+    ====================== -->
+    <h2 class="mb-3">Usuarios registrados</h2>
+
+    <table class="table table-bordered table-striped mb-4">
+        <thead class="table-dark">
+            <tr>
+                <th>ID</th><th>Nombre</th><th>Email</th><th>Rol</th>
+            </tr>
+        </thead>
+
+        <tbody>
         <?php while ($u = $usuarios->fetch_assoc()): ?>
             <tr>
-                <td><?php echo $u['id_usuario']; ?></td>
-                <td><?php echo $u['nombre']; ?></td>
-                <td><?php echo $u['email']; ?></td>
-                <td><?php echo $u['rol']; ?></td>
+                <td><?= $u['id_usuario'] ?></td>
+                <td><?= htmlspecialchars($u['nombre']) ?></td>
+                <td><?= htmlspecialchars($u['email']) ?></td>
+                <td><?= $u['rol'] ?></td>
             </tr>
         <?php endwhile; ?>
-    <?php else: ?>
-        <tr><td colspan="4">No hay usuarios registrados.</td></tr>
-    <?php endif; ?>
-</table>
+        </tbody>
+    </table>
 
-<hr>
+    <hr>
 
-<!-- =====================
-     GESTIÓN DE DISPONIBILIDAD
-====================== -->
-<h2>Disponibilidad (horas libres)</h2>
+    <!-- =====================
+         DISPONIBILIDAD
+    ====================== -->
+    <h2 class="mb-3">Disponibilidad del negocio</h2>
 
-<table border="1" cellpadding="5" cellspacing="0">
-    <tr>
-        <th>ID</th>
-        <th>Fecha</th>
-        <th>Hora</th>
-        <th>Disponible</th>
-        <th>Acciones</th>
-    </tr>
+    <p class="text-muted">Horario permitido: <strong>10:00–14:00</strong> y <strong>17:00–20:30</strong></p>
 
-    <?php if ($disponibilidad && $disponibilidad->num_rows > 0): ?>
+    <table class="table table-bordered table-striped mb-3">
+        <thead class="table-dark">
+            <tr>
+                <th>ID</th><th>Fecha</th><th>Hora</th><th>Disponible</th><th>Acciones</th>
+            </tr>
+        </thead>
+
+        <tbody>
         <?php while ($d = $disponibilidad->fetch_assoc()): ?>
             <tr>
-                <td><?php echo $d['id_disponibilidad']; ?></td>
-                <td><?php echo $d['fecha']; ?></td>
-                <td><?php echo $d['hora']; ?></td>
-                <td><?php echo $d['disponible']; ?></td>
+                <td><?= $d['id_disponibilidad'] ?></td>
+                <td><?= $d['fecha'] ?></td>
+                <td><?= substr($d['hora'], 0, 5) ?></td>
                 <td>
-                    <a href="admin.php?eliminar_disp=<?php echo $d['id_disponibilidad']; ?>">Eliminar</a>
+                    <span class="badge bg-<?= $d['disponible'] ? 'success' : 'secondary' ?>">
+                        <?= $d['disponible'] ? 'Sí' : 'No' ?>
+                    </span>
+                </td>
+
+                <td>
+                    <a href="admin.php?eliminar_disp=<?= $d['id_disponibilidad'] ?>" 
+                       class="btn btn-danger btn-sm"
+                       data-confirm="¿Eliminar esta disponibilidad?">
+                       Eliminar
+                    </a>
                 </td>
             </tr>
         <?php endwhile; ?>
-    <?php else: ?>
-        <tr><td colspan="5">No hay horarios creados.</td></tr>
-    <?php endif; ?>
-</table>
+        </tbody>
+    </table>
 
-<h3>Añadir nueva disponibilidad</h3>
+    <!-- Añadir disponibilidad -->
+    <h4>Añadir nueva disponibilidad</h4>
 
-<form action="admin.php" method="POST">
-    <label>Fecha: </label>
-    <input type="date" name="nueva_fecha" required>
+    <form action="" method="POST" class="row g-3 mb-5 mt-2">
 
-    <label>Hora: </label>
-    <input type="time" name="nueva_hora" required>
+        <div class="col-md-4">
+            <label class="form-label">Fecha</label>
+            <input type="date" name="nueva_fecha" class="form-control" required>
+        </div>
 
-    <button type="submit">Agregar</button>
-</form>
+        <div class="col-md-4">
+            <label class="form-label">Hora</label>
+            <input type="time" name="nueva_hora" class="form-control"
+                   required min="10:00" max="20:30" step="1800">
+        </div>
 
+        <div class="col-md-4 d-flex align-items-end">
+            <button type="submit" class="btn btn-primary w-100">Agregar disponibilidad</button>
+        </div>
+
+    </form>
+
+</div>
+
+<script src="public/js/app.js"></script>
 </body>
 </html>
-
-
